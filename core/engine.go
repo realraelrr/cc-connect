@@ -258,6 +258,11 @@ type Engine struct {
 	workspacePool                *workspacePool
 	initFlows                    map[string]*workspaceInitFlow // workspace channel key → init state
 	initFlowsMu                  sync.Mutex
+	knotWorkspace                bool
+	knotWorkspaceHelper          string
+	knotWorkspaceRoot            string
+	knotSessionEnvMu             sync.Mutex
+	knotSessionEnv               map[string][]string
 
 	// Terminal observation (--observe)
 	observeEnabled    bool
@@ -481,9 +486,30 @@ func (e *Engine) SetMultiWorkspace(baseDir, bindingStorePath string) {
 	e.multiWorkspace = true
 	e.baseDir = baseDir
 	e.workspaceBindings = NewWorkspaceBindingManager(bindingStorePath)
-	e.workspacePool = newWorkspacePool(DefaultWorkspaceIdleTimeout)
+	e.ensureWorkspacePool()
 	e.initFlows = make(map[string]*workspaceInitFlow)
-	go e.runIdleReaper()
+}
+
+// SetKnotWorkspace enables per-message workspace resolution through Knot's
+// deterministic filesystem helper. The helper returns a user workspace cwd and
+// optional group/conversation context; group context is intentionally not used
+// as a second agent cwd.
+func (e *Engine) SetKnotWorkspace(helper, root string) {
+	e.multiWorkspace = true
+	e.knotWorkspace = true
+	e.knotWorkspaceHelper = helper
+	e.knotWorkspaceRoot = root
+	if e.knotSessionEnv == nil {
+		e.knotSessionEnv = make(map[string][]string)
+	}
+	e.ensureWorkspacePool()
+}
+
+func (e *Engine) ensureWorkspacePool() {
+	if e.workspacePool == nil {
+		e.workspacePool = newWorkspacePool(DefaultWorkspaceIdleTimeout)
+		go e.runIdleReaper()
+	}
 }
 
 // SetWorkspaceIdleTimeout overrides the workspace idle reaper timeout.
@@ -2031,7 +2057,15 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 	var wsAgent Agent
 	var wsSessions *SessionManager
 	var resolvedWorkspace string
-	if e.multiWorkspace {
+	if e.knotWorkspace {
+		var err error
+		wsAgent, wsSessions, _, resolvedWorkspace, err = e.knotWorkspaceContext(msg, true)
+		if err != nil {
+			slog.Error("knot workspace resolution failed", "err", err)
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf("Failed to resolve workspace: %v", err))
+			return
+		}
+	} else if e.multiWorkspace {
 		channelID := effectiveChannelID(msg)
 		channelKey := effectiveWorkspaceChannelKey(msg)
 		workspace, channelName, err := e.resolveWorkspace(p, channelID)
@@ -2936,6 +2970,9 @@ func (e *Engine) getOrCreateWorkspaceAgent(workspace string) (Agent, *SessionMan
 }
 
 func (e *Engine) resolveChannelWorkDir(workspace, interactiveKey string) string {
+	if e.knotWorkspace {
+		return workspace
+	}
 	if e.projectState == nil {
 		return workspace
 	}
@@ -2959,6 +2996,186 @@ func (e *Engine) workspaceContext(workspace, sessionKey string) (Agent, *Session
 		return nil, nil, "", "", err
 	}
 	return wsAgent, wsSessions, interactiveKey, effectiveDir, nil
+}
+
+type knotWorkspaceResolution struct {
+	workspace string
+	env       []string
+}
+
+func (e *Engine) knotWorkspaceContext(msg *Message, touchPool bool) (Agent, *SessionManager, string, string, error) {
+	resolution, err := e.resolveKnotWorkspace(msg)
+	if err != nil {
+		return nil, nil, "", "", err
+	}
+
+	workspace := resolution.workspace
+	if workspace == "" {
+		return e.agent, e.sessions, msg.SessionKey, "", nil
+	}
+	if touchPool {
+		if ws := e.workspacePool.Get(workspace); ws != nil {
+			ws.Touch()
+		}
+	}
+
+	agent, sessions, interactiveKey, effectiveDir, err := e.workspaceContext(workspace, msg.SessionKey)
+	if err != nil {
+		return nil, nil, "", "", fmt.Errorf("initialize workspace: %w", err)
+	}
+	e.setKnotSessionEnv(interactiveKey, resolution.env)
+	return agent, sessions, interactiveKey, effectiveDir, nil
+}
+
+func (e *Engine) resolveKnotWorkspace(msg *Message) (*knotWorkspaceResolution, error) {
+	helper := strings.TrimSpace(e.knotWorkspaceHelper)
+	root := strings.TrimSpace(e.knotWorkspaceRoot)
+	if root == "" {
+		root = strings.TrimSpace(e.baseWorkDir)
+	}
+	if helper == "" && root != "" {
+		helper = filepath.Join(root, "bootstrap", "knot-workspace.sh")
+	}
+	if helper == "" {
+		return nil, fmt.Errorf("knot workspace helper is not configured")
+	}
+
+	platform := msg.Platform
+	if platform == "" {
+		platform = extractPlatformName(msg.SessionKey)
+	}
+	userID := msg.UserID
+	if userID == "" {
+		userID = extractUserID(msg.SessionKey)
+	}
+	if platform == "" || userID == "" {
+		return nil, fmt.Errorf("missing platform or user id")
+	}
+
+	identityKey := fmt.Sprintf("%s:user:%s", platform, userID)
+	args := []string{
+		"--platform", platform,
+		"--user-id", userID,
+		"--identity-key", identityKey,
+	}
+	if root != "" {
+		args = append(args, "--root", root)
+	}
+	if chatID := effectiveChannelID(msg); chatID != "" {
+		args = append(args, "--chat-id", chatID)
+	}
+	if msg.UserName != "" {
+		args = append(args, "--name", msg.UserName)
+	}
+	if msg.ChatName != "" {
+		args = append(args, "--group-name", msg.ChatName)
+	}
+
+	ctx, cancel := context.WithTimeout(e.ctx, 5*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, helper, args...)
+	cmd.Env = os.Environ()
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return nil, fmt.Errorf("knot workspace helper timed out")
+	}
+	if err != nil {
+		detail := strings.TrimSpace(string(out))
+		if len(detail) > 500 {
+			detail = detail[:500] + "..."
+		}
+		if detail == "" {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %s", err, detail)
+	}
+
+	exports := parseKnotWorkspaceExports(out)
+	workspace := strings.TrimSpace(exports["KNOT_ACTIVE_WORKSPACE"])
+	if workspace == "" {
+		return nil, fmt.Errorf("knot workspace helper did not print KNOT_ACTIVE_WORKSPACE")
+	}
+	info, err := os.Stat(workspace)
+	if err != nil {
+		return nil, fmt.Errorf("resolved workspace is not available: %w", err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("resolved workspace is not a directory: %s", workspace)
+	}
+	exports["KNOT_ACTIVE_WORKSPACE"] = normalizeWorkspacePath(workspace)
+	if userWorkspace := strings.TrimSpace(exports["KNOT_USER_WORKSPACE"]); userWorkspace != "" {
+		exports["KNOT_USER_WORKSPACE"] = normalizeWorkspacePath(userWorkspace)
+	}
+	return &knotWorkspaceResolution{
+		workspace: normalizeWorkspacePath(workspace),
+		env:       knotExportsToEnv(exports),
+	}, nil
+}
+
+func parseKnotWorkspaceExports(out []byte) map[string]string {
+	exports := make(map[string]string)
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "export ") {
+			continue
+		}
+		keyValue := strings.TrimPrefix(line, "export ")
+		key, value, ok := strings.Cut(keyValue, "=")
+		if !ok || key == "" {
+			continue
+		}
+		exports[key] = unquoteKnotWorkspaceValue(value)
+	}
+	return exports
+}
+
+func unquoteKnotWorkspaceValue(value string) string {
+	if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+		value = value[1 : len(value)-1]
+		value = strings.ReplaceAll(value, `'\''`, `'`)
+	}
+	return value
+}
+
+func knotExportsToEnv(exports map[string]string) []string {
+	keys := make([]string, 0, len(exports))
+	for key := range exports {
+		if strings.HasPrefix(key, "KNOT_") {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	env := make([]string, 0, len(keys))
+	for _, key := range keys {
+		env = append(env, key+"="+exports[key])
+	}
+	return env
+}
+
+func (e *Engine) setKnotSessionEnv(interactiveKey string, env []string) {
+	if interactiveKey == "" {
+		return
+	}
+	e.knotSessionEnvMu.Lock()
+	defer e.knotSessionEnvMu.Unlock()
+	if e.knotSessionEnv == nil {
+		e.knotSessionEnv = make(map[string][]string)
+	}
+	e.knotSessionEnv[interactiveKey] = append([]string(nil), env...)
+}
+
+func (e *Engine) knotEnvForSession(interactiveKey string) []string {
+	e.knotSessionEnvMu.Lock()
+	defer e.knotSessionEnvMu.Unlock()
+	return append([]string(nil), e.knotSessionEnv[interactiveKey]...)
+}
+
+func (e *Engine) clearKnotSessionEnv(interactiveKey string) {
+	e.knotSessionEnvMu.Lock()
+	defer e.knotSessionEnvMu.Unlock()
+	delete(e.knotSessionEnv, interactiveKey)
 }
 
 // getOrCreateInteractiveStateWith accepts an optional agent override for multi-workspace mode.
@@ -3037,6 +3254,9 @@ func (e *Engine) getOrCreateInteractiveStateWith(sessionKey string, p Platform, 
 		}
 		if e.dataDir != "" {
 			envVars = append(envVars, "CC_DATA_DIR="+e.dataDir)
+		}
+		if e.knotWorkspace {
+			envVars = append(envVars, e.knotEnvForSession(sessionKey)...)
 		}
 		if exePath, err := os.Executable(); err == nil {
 			binDir := filepath.Dir(exePath)
@@ -3214,6 +3434,7 @@ func (e *Engine) cleanupInteractiveState(sessionKey string, expected ...*interac
 	}
 	delete(e.interactiveStates, sessionKey)
 	e.interactiveMu.Unlock()
+	e.clearKnotSessionEnv(sessionKey)
 }
 
 func (e *Engine) closeAgentSessionAsync(sessionKey string, agentSession AgentSession) {
@@ -5109,7 +5330,11 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 	case "tts":
 		e.cmdTTS(p, msg, args)
 	case "workspace":
-		if !e.multiWorkspace {
+		if e.knotWorkspace {
+			e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandDisabled), "/workspace"))
+			return true
+		}
+		if !e.multiWorkspace || e.workspaceBindings == nil {
 			e.reply(p, msg.ReplyCtx, e.i18n.T(MsgWsNotEnabled))
 			return true
 		}
@@ -6272,19 +6497,12 @@ func (e *Engine) cmdDiff(p Platform, msg *Message, raw string) {
 		return
 	}
 
-	// Resolve working directory (same pattern as cmdShell)
-	var workDir string
-	if e.multiWorkspace {
-		channelKey := effectiveWorkspaceChannelKey(msg)
-		if b, _, usable := e.lookupEffectiveWorkspaceBinding(channelKey); usable {
-			workDir = normalizeWorkspacePath(b.Workspace)
-		}
+	agent, _, _, err := e.commandContext(p, msg)
+	if err != nil {
+		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
+		return
 	}
-	if workDir == "" {
-		if wd, ok := e.agent.(interface{ GetWorkDir() string }); ok {
-			workDir = wd.GetWorkDir()
-		}
-	}
+	workDir := e.commandWorkDir(agent, msg)
 	if workDir == "" {
 		workDir, _ = os.Getwd()
 	}
@@ -6376,6 +6594,9 @@ func (e *Engine) diff2html(ctx context.Context, diff []byte, workDir, title stri
 // dirApply applies /dir mutations (same semantics as cmdDir). sessionKey is used for GetOrCreateActive.
 // On failure returns a non-empty errMsg; on success returns ("", successMsg) for plain-text replies.
 func (e *Engine) dirApply(agent Agent, sessions *SessionManager, interactiveKey, sessionKey string, args []string) (errMsg, successMsg string) {
+	if e.knotWorkspace {
+		return fmt.Sprintf(e.i18n.T(MsgCommandDisabled), "/dir"), ""
+	}
 	switcher, ok := agent.(WorkDirSwitcher)
 	if !ok {
 		return e.i18n.T(MsgDirNotSupported), ""
@@ -6492,6 +6713,10 @@ func (e *Engine) dirApply(agent Agent, sessions *SessionManager, interactiveKey,
 }
 
 func (e *Engine) cmdDir(p Platform, msg *Message, args []string) {
+	if e.knotWorkspace {
+		e.reply(p, msg.ReplyCtx, fmt.Sprintf(e.i18n.T(MsgCommandDisabled), "/dir"))
+		return
+	}
 	agent, sessions, interactiveKey, err := e.commandContext(p, msg)
 	if err != nil {
 		e.reply(p, msg.ReplyCtx, e.i18n.Tf(MsgWsResolutionError, err))
@@ -9942,6 +10167,9 @@ func (e *Engine) executeCardAction(cmd, args, sessionKey string) {
 		session.ClearHistory()
 
 	case "/dir":
+		if e.knotWorkspace {
+			return
+		}
 		fields := strings.Fields(args)
 		if len(fields) == 0 {
 			return
@@ -13547,6 +13775,9 @@ func (e *Engine) commandContext(p Platform, msg *Message) (Agent, *SessionManage
 // the resolved workspace path for callers that need to forward it to
 // processInteractiveMessageWith (idle reaper bookkeeping, reply footer, etc).
 func (e *Engine) commandContextWithWorkspace(p Platform, msg *Message) (Agent, *SessionManager, string, string, error) {
+	if e.knotWorkspace {
+		return e.knotWorkspaceContext(msg, false)
+	}
 	if !e.multiWorkspace {
 		return e.agent, e.sessions, msg.SessionKey, "", nil
 	}
@@ -13572,13 +13803,15 @@ func (e *Engine) commandContextWithWorkspace(p Platform, msg *Message) (Agent, *
 // sessionContextForKey resolves the agent and session manager for a sessionKey.
 // It uses existing workspace bindings and falls back to global context if unresolved.
 func (e *Engine) sessionContextForKey(sessionKey string) (Agent, *SessionManager) {
-	if !e.multiWorkspace || e.workspaceBindings == nil {
+	if !e.multiWorkspace {
 		return e.agent, e.sessions
 	}
-	if channelKey := extractWorkspaceChannelKey(sessionKey); channelKey != "" {
-		if b, _, usable := e.lookupEffectiveWorkspaceBinding(channelKey); usable {
-			if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(normalizeWorkspacePath(b.Workspace)); err == nil {
-				return wsAgent, wsSessions
+	if e.workspaceBindings != nil {
+		if channelKey := extractWorkspaceChannelKey(sessionKey); channelKey != "" {
+			if b, _, usable := e.lookupEffectiveWorkspaceBinding(channelKey); usable {
+				if wsAgent, wsSessions, err := e.getOrCreateWorkspaceAgent(normalizeWorkspacePath(b.Workspace)); err == nil {
+					return wsAgent, wsSessions
+				}
 			}
 		}
 	}
@@ -13620,7 +13853,7 @@ func (e *Engine) workspaceFromLiveState(sessionKey string) string {
 // In multi-workspace mode, it prefixes with the bound workspace path when available.
 func (e *Engine) interactiveKeyForSessionKey(sessionKey string) string {
 	// Single-workspace fast path: no scan, no binding lookup, no lock.
-	if !e.multiWorkspace || e.workspaceBindings == nil {
+	if !e.multiWorkspace {
 		return sessionKey
 	}
 	e.interactiveMu.Lock()
@@ -13652,15 +13885,17 @@ func (e *Engine) interactiveKeyForSessionKey(sessionKey string) string {
 //     ID, so step 2 misses. The state map was keyed correctly at processing
 //     time, so we recover the workspace prefix from there.
 func (e *Engine) interactiveKeyForSessionKeyLocked(sessionKey string) string {
-	if !e.multiWorkspace || e.workspaceBindings == nil {
+	if !e.multiWorkspace {
 		return sessionKey
 	}
 	if _, ok := e.interactiveStates[sessionKey]; ok {
 		return sessionKey
 	}
-	if channelKey := extractWorkspaceChannelKey(sessionKey); channelKey != "" {
-		if b, _, usable := e.lookupEffectiveWorkspaceBinding(channelKey); usable {
-			return normalizeWorkspacePath(b.Workspace) + ":" + sessionKey
+	if e.workspaceBindings != nil {
+		if channelKey := extractWorkspaceChannelKey(sessionKey); channelKey != "" {
+			if b, _, usable := e.lookupEffectiveWorkspaceBinding(channelKey); usable {
+				return normalizeWorkspacePath(b.Workspace) + ":" + sessionKey
+			}
 		}
 	}
 	if found := findInteractiveKeyInStatesLocked(e.interactiveStates, sessionKey); found != "" {

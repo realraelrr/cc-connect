@@ -176,14 +176,14 @@ const (
 
 // DisplayConfig controls how intermediate messages (thinking, tool output) are shown.
 type DisplayConfig struct {
-	Mode               *string `toml:"mode"`                 // "full" (default), "compact", or "quiet"
-	CardMode           *string `toml:"card_mode"`            // "legacy" (default) or "rich" (Card 2.0 Feishu)
-	ThinkingMessages   *bool   `toml:"thinking_messages"`    // whether thinking messages are shown; default true
-	ThinkingMaxLen     *int    `toml:"thinking_max_len"`     // max chars for thinking messages; 0 = no truncation; default 300
-	ToolMaxLen         *int    `toml:"tool_max_len"`         // max chars for tool use messages; 0 = no truncation; default 500
-	ToolMessages       *bool   `toml:"tool_messages"`        // whether tool progress messages are shown; default true
-	ShowContextIndicator *bool `toml:"show_context_indicator"` // whether [ctx: ~N%] suffix is shown; default true
-	ReplyFooter        *bool   `toml:"reply_footer"`         // whether Codex-like footer is shown; default true
+	Mode                 *string `toml:"mode"`                   // "full" (default), "compact", or "quiet"
+	CardMode             *string `toml:"card_mode"`              // "legacy" (default) or "rich" (Card 2.0 Feishu)
+	ThinkingMessages     *bool   `toml:"thinking_messages"`      // whether thinking messages are shown; default true
+	ThinkingMaxLen       *int    `toml:"thinking_max_len"`       // max chars for thinking messages; 0 = no truncation; default 300
+	ToolMaxLen           *int    `toml:"tool_max_len"`           // max chars for tool use messages; 0 = no truncation; default 500
+	ToolMessages         *bool   `toml:"tool_messages"`          // whether tool progress messages are shown; default true
+	ShowContextIndicator *bool   `toml:"show_context_indicator"` // whether [ctx: ~N%] suffix is shown; default true
+	ReplyFooter          *bool   `toml:"reply_footer"`           // whether Codex-like footer is shown; default true
 }
 
 // StreamPreviewConfig controls real-time streaming preview in IM.
@@ -333,10 +333,11 @@ type ReferenceConfig struct {
 
 // ProjectConfig binds one agent (with a specific work_dir) to one or more platforms.
 type ProjectConfig struct {
-	Name    string `toml:"name"`
-	Mode    string `toml:"mode,omitempty"`     // "" or "multi-workspace"
-	BaseDir string `toml:"base_dir,omitempty"` // parent dir for workspaces
-	SkipGit *bool  `toml:"skip_git,omitempty"`
+	Name          string               `toml:"name"`
+	Mode          string               `toml:"mode,omitempty"`     // "" or "multi-workspace"
+	BaseDir       string               `toml:"base_dir,omitempty"` // parent dir for workspaces
+	KnotWorkspace *KnotWorkspaceConfig `toml:"knot_workspace,omitempty"`
+	SkipGit       *bool                `toml:"skip_git,omitempty"`
 	// WorkspaceInitAllowLocalPaths allows /workspace init and the conversational
 	// init flow to bind existing local directories. Default false keeps init
 	// limited to git URLs; use /workspace bind or /workspace route for explicit
@@ -404,6 +405,12 @@ type ProjectConfig struct {
 	// cc-connect, hiding sessions created by direct CLI usage in the same work_dir.
 	// Default is false (show all sessions).
 	FilterExternalSessions *bool `toml:"filter_external_sessions,omitempty"`
+}
+
+type KnotWorkspaceConfig struct {
+	Enabled bool   `toml:"enabled,omitempty"`
+	Helper  string `toml:"helper,omitempty"`
+	Root    string `toml:"root,omitempty"`
 }
 
 type AgentConfig struct {

@@ -285,6 +285,13 @@ func main() {
 		engine.SetProjectStateStore(projectState)
 		engine.SetDataDir(cfg.DataDir)
 
+		if proj.KnotWorkspace != nil && proj.KnotWorkspace.Enabled {
+			helper := expandHomePath(proj.KnotWorkspace.Helper)
+			root := expandHomePath(proj.KnotWorkspace.Root)
+			engine.SetKnotWorkspace(helper, root)
+			slog.Info("knot workspace resolver enabled", "project", proj.Name, "helper", helper, "root", root)
+		}
+
 		// Wire multi-workspace mode
 		if proj.Mode == "multi-workspace" {
 			baseDir := proj.BaseDir
@@ -1250,6 +1257,17 @@ func resolveClaudeProjectDir(workDir string) string {
 		return ""
 	}
 	return dir
+}
+
+func expandHomePath(path string) string {
+	if !strings.HasPrefix(path, "~/") {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	return filepath.Join(home, path[2:])
 }
 
 // resolveConfigPath determines which config file to use.
