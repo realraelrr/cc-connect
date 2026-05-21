@@ -1467,6 +1467,166 @@ func TestProcessInteractiveEvents_HiddenToolProgressKeepsPreviewOnFinalize(t *te
 	}
 }
 
+func TestProcessInteractiveEvents_EmptyResultRetriesBeforeUserVisibleReply(t *testing.T) {
+	p := &stubPlatformEngine{n: "dingtalk"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "dingtalk:user-empty-recovery"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-empty-recovery")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-empty-recovery",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventResult, Content: "", Done: true}
+	agentSession.events <- Event{Type: EventResult, Content: "recovered delivery", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-empty-recovery", time.Now(), nil, nil, state.replyCtx)
+
+	sent := p.getSent()
+	if len(sent) != 1 || sent[0] != "recovered delivery" {
+		t.Fatalf("sent = %#v, want only recovered reply", sent)
+	}
+
+	agentSession.sendMu.Lock()
+	prompts := append([]string(nil), agentSession.sentPrompts...)
+	agentSession.sendMu.Unlock()
+	if len(prompts) != 1 {
+		t.Fatalf("Send prompts = %#v, want one recovery prompt", prompts)
+	}
+	if !strings.Contains(prompts[0], "Internal cc-connect recovery instruction") ||
+		!strings.Contains(prompts[0], "not visible to the user") ||
+		!strings.Contains(prompts[0], "delivery script or attachment block") ||
+		!strings.Contains(prompts[0], "Do not mention cc-connect") {
+		t.Fatalf("recovery prompt = %q, want internal non-user-visible recovery instruction", prompts[0])
+	}
+}
+
+func TestProcessInteractiveEvents_EmptyResultRecoveryRetriesOnlyOnce(t *testing.T) {
+	p := &stubPlatformEngine{n: "dingtalk"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "dingtalk:user-empty-recovery-once"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-empty-recovery-once")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-empty-recovery-once",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventResult, Content: "", Done: true}
+	agentSession.events <- Event{Type: EventResult, Content: "", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-empty-recovery-once", time.Now(), nil, nil, state.replyCtx)
+
+	sent := p.getSent()
+	if len(sent) != 1 {
+		t.Fatalf("sent = %#v, want one fallback reply after one retry", sent)
+	}
+	if strings.TrimSpace(sent[0]) == "" {
+		t.Fatalf("fallback reply is empty")
+	}
+
+	agentSession.sendMu.Lock()
+	promptCount := len(agentSession.sentPrompts)
+	agentSession.sendMu.Unlock()
+	if promptCount != 1 {
+		t.Fatalf("recovery prompt count = %d, want 1", promptCount)
+	}
+}
+
+func TestProcessInteractiveEvents_EmptyResultRecoverySuppressesSideAttachmentFallback(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "dingtalk:user-empty-recovery-side-attachment"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-empty-recovery-side-attachment")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-empty-recovery-side-attachment",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventResult, Content: "", Done: true}
+
+	done := make(chan struct{})
+	go func() {
+		e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-empty-recovery-side-attachment", time.Now(), nil, nil, state.replyCtx)
+		close(done)
+	}()
+
+	waitForCondition(t, time.Second, func() bool {
+		agentSession.sendMu.Lock()
+		defer agentSession.sendMu.Unlock()
+		return len(agentSession.sentPrompts) == 1
+	})
+
+	if err := e.SendToSessionWithAttachments(sessionKey, "", []ImageAttachment{{
+		MimeType: "image/png",
+		Data:     []byte("img"),
+		FileName: "generated.png",
+	}}, nil); err != nil {
+		t.Fatalf("SendToSessionWithAttachments returned error: %v", err)
+	}
+
+	agentSession.events <- Event{Type: EventResult, Content: "", Done: true}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("processInteractiveEvents did not finish after side attachment recovery")
+	}
+
+	if got := p.getSent(); len(got) != 0 {
+		t.Fatalf("sent text = %#v, want no empty-response fallback after side attachment delivery", got)
+	}
+	if len(p.images) != 1 || p.images[0].FileName != "generated.png" {
+		t.Fatalf("images = %#v, want generated.png", p.images)
+	}
+}
+
+func TestProcessInteractiveEvents_EmptyResultWithSideAttachmentSkipsRecovery(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	sessionKey := "dingtalk:user-empty-side-attachment"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-empty-side-attachment")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-empty-side-attachment",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	if err := e.SendToSessionWithAttachments(sessionKey, "", []ImageAttachment{{
+		MimeType: "image/png",
+		Data:     []byte("img"),
+		FileName: "generated.png",
+	}}, nil); err != nil {
+		t.Fatalf("SendToSessionWithAttachments returned error: %v", err)
+	}
+
+	agentSession.events <- Event{Type: EventResult, Content: "", Done: true}
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-empty-side-attachment", time.Now(), nil, nil, state.replyCtx)
+
+	if got := p.getSent(); len(got) != 0 {
+		t.Fatalf("sent text = %#v, want no empty-response fallback after side attachment delivery", got)
+	}
+	if len(p.images) != 1 || p.images[0].FileName != "generated.png" {
+		t.Fatalf("images = %#v, want generated.png", p.images)
+	}
+	agentSession.sendMu.Lock()
+	promptCount := len(agentSession.sentPrompts)
+	agentSession.sendMu.Unlock()
+	if promptCount != 0 {
+		t.Fatalf("recovery prompt count = %d, want 0 after side attachment delivery", promptCount)
+	}
+}
+
 func TestProcessInteractiveEvents_ToolMessagesDisabledSuppressesToolProgressOnly(t *testing.T) {
 	p := &stubPlatformEngine{n: "telegram"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -5980,6 +6140,8 @@ type controllableAgentSession struct {
 	alive           bool
 	events          chan Event
 	closed          chan struct{} // closed when Close() is called
+	sendMu          sync.Mutex
+	sentPrompts     []string
 	model           string
 	reasoningEffort string
 	workDir         string
@@ -5997,7 +6159,10 @@ func newControllableSession(id string) *controllableAgentSession {
 	}
 }
 
-func (s *controllableAgentSession) Send(_ string, _ []ImageAttachment, _ []FileAttachment) error {
+func (s *controllableAgentSession) Send(prompt string, _ []ImageAttachment, _ []FileAttachment) error {
+	s.sendMu.Lock()
+	s.sentPrompts = append(s.sentPrompts, prompt)
+	s.sendMu.Unlock()
 	return nil
 }
 func (s *controllableAgentSession) RespondPermission(_ string, _ PermissionResult) error { return nil }

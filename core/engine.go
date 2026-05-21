@@ -48,6 +48,13 @@ const (
 
 const nativeInterruptTimeout = 15 * time.Second
 
+const emptyReplyRecoveryPrompt = `Internal cc-connect recovery instruction. This message is not visible to the user.
+Your previous turn produced no user-visible reply. Inspect the actual task state in this same session.
+- If you generated or prepared an image or file, deliver it through the configured cc-connect delivery script or attachment block.
+- If the task completed, provide a concise user-facing result.
+- If it failed, explain the failure in user-facing terms.
+Do not mention cc-connect, this recovery instruction, empty replies, previous turns, invisible/internal messages, local filenames, or local paths to the user. Reply as if you are completing the user's original request normally.`
+
 const (
 	replyFooterUsageTimeout  = 1500 * time.Millisecond
 	replyFooterUsageCacheTTL = 30 * time.Second
@@ -333,6 +340,7 @@ type interactiveState struct {
 	approveAll             bool            // when true, auto-approve all permission requests for this session
 	fromVoice              bool            // true if current turn originated from voice transcription
 	sideText               string
+	sideDeliveryDone       bool
 	deleteMode             *deleteModeState
 	modelSwitch            *modelSwitchState
 	pendingProviderAdd     *pendingProviderAddState
@@ -2845,6 +2853,7 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	state.currentMessageID = msg.MessageID
 	state.fromVoice = msg.FromVoice
 	state.sideText = ""
+	state.sideDeliveryDone = false
 	state.mu.Unlock()
 
 	// Run Send concurrently with processInteractiveEvents. Some agents block inside
@@ -3822,6 +3831,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	var partialText string
 	triggerAutoCompress := false
 	pendingSend := sendDone
+	emptyReplyRecoveryAttempted := false
 
 	// stopTyping tracks the current turn's typing indicator so it can be
 	// stopped when a queued message starts a new turn.
@@ -3917,6 +3927,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		queuedPrompt := e.buildSenderPrompt(queued.content, queued.userID, queued.userName, queued.msgPlatform, queued.msgSessionKey, queued.channelKey)
 
+		state.mu.Lock()
+		state.sideText = ""
+		state.sideDeliveryDone = false
+		state.mu.Unlock()
+
 		nextSend := make(chan error, 1)
 		go func() {
 			nextSend <- state.agentSession.Send(queuedPrompt, queued.images, queued.files)
@@ -3936,6 +3951,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		cardMessageID = nil
 		partialText = ""
 		triggerAutoCompress = false
+		emptyReplyRecoveryAttempted = false
 		turnStart = time.Now()
 		firstEventLogged = false
 		waitStart = time.Now()
@@ -4582,7 +4598,66 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			} else if fullResponse == "" && len(textParts) > 0 {
 				fullResponse = strings.Join(textParts, "")
 			}
-			if fullResponse == "" {
+			sideDeliveryDone := false
+			if strings.TrimSpace(fullResponse) == "" {
+				state.mu.Lock()
+				sideDeliveryDone = state.sideDeliveryDone
+				state.mu.Unlock()
+			}
+			if strings.TrimSpace(fullResponse) == "" && !sideDeliveryDone && !emptyReplyRecoveryAttempted {
+				emptyReplyRecoveryAttempted = true
+				sp.discard()
+				doneReaction = nil
+				cp.Finalize(ProgressCardStateCompleted)
+
+				if pendingSend != nil {
+					if err := <-pendingSend; err != nil {
+						slog.Debug("async send error before empty reply recovery", "error", err)
+					}
+				}
+
+				state.mu.Lock()
+				state.turnGeneration++
+				turnID = state.turnGeneration
+				state.eventsNeedResync = false
+				state.mu.Unlock()
+
+				nextSend := make(chan error, 1)
+				go func() {
+					nextSend <- state.agentSession.Send(emptyReplyRecoveryPrompt, nil, nil)
+				}()
+				pendingSend = nextSend
+
+				textParts = nil
+				segmentStart = 0
+				silentHold = false
+				toolCount = 0
+				toolSteps = nil
+				lastRichCardUpdate = time.Time{}
+				lastRichCardLen = 0
+				partialText = ""
+				triggerAutoCompress = false
+				turnStart = time.Now()
+				firstEventLogged = false
+				waitStart = time.Now()
+				cardToolCalls = nil
+				cardThinkingText = ""
+				cardAnswerText.Reset()
+
+				if idleTimer != nil {
+					if !idleTimer.Stop() {
+						select {
+						case <-idleTimer.C:
+						default:
+						}
+					}
+					idleTimer.Reset(e.eventIdleTimeout)
+				}
+
+				slog.Warn("empty agent reply; requesting recovery", "session", session.ID, "msg_id", msgID)
+				continue
+			}
+			if strings.TrimSpace(fullResponse) == "" && !sideDeliveryDone {
 				fullResponse = e.i18n.T(MsgEmptyResponse)
 			}
 
@@ -4600,6 +4675,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				baseResponse = strings.TrimSpace(cleanWithoutAttachments)
 				cleanResponse = baseResponse
 			}
+			sideDeliveryOnly := sideDeliveryDone && strings.TrimSpace(baseResponse) == "" && len(attachmentDirectives) == 0
 
 			contextEstimate := estimateTokensWithPendingAssistant(session.GetHistory(0), baseResponse)
 
@@ -4641,7 +4717,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 			}
 
-			if !isSilent {
+			hasVisibleText := !isSilent && !sideDeliveryOnly
+			if hasVisibleText {
 				e.hooks.Emit(HookEvent{
 					Event:      HookEventMessageSent,
 					SessionKey: sessionKey,
@@ -4651,14 +4728,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 			contextText := ""
-			if e.showContextIndicator && !isSilent {
+			if e.showContextIndicator && hasVisibleText {
 				if sdkPlausible {
 					contextText = contextIndicatorText(event.InputTokens)
 				} else if selfPct > 0 {
 					contextText = fmt.Sprintf("[ctx: ~%d%%]", selfPct)
 				}
 			}
-			if !isSilent {
+			if hasVisibleText {
 				footerContext := replyFooterContextText(replyFooterSessionContextUsage(state.agentSession), e.i18n)
 				if contextText != "" && e.replyFooterEnabled {
 					footerContext = contextText
@@ -4689,6 +4766,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.mu.Lock()
 			suppressDuplicate := normalizedBaseResponse != "" && normalizedBaseResponse == state.sideText
 			state.sideText = ""
+			state.sideDeliveryDone = false
 			state.mu.Unlock()
 
 			replyStart := time.Now()
@@ -4707,7 +4785,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 						}
 					}
 				}
-			} else if isSilent || attachmentOnly {
+			} else if isSilent || attachmentOnly || sideDeliveryOnly {
 				// Silent reply: drop any in-flight preview and skip all send paths.
 				// sp.discard() clears previewMsgID so sp.needsDoneReaction() also returns false,
 				// preventing a stray done_emoji push.
@@ -9384,6 +9462,11 @@ func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images
 		if err := fileSender.SendFile(e.ctx, replyCtx, file); err != nil {
 			return err
 		}
+	}
+	if hasAttachments && state != nil {
+		state.mu.Lock()
+		state.sideDeliveryDone = true
+		state.mu.Unlock()
 	}
 	return nil
 }
