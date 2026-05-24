@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -114,6 +115,110 @@ func countSubstring(items []string, needle string) int {
 		}
 	}
 	return count
+}
+
+func newTestKnotAuditContext(t *testing.T) (*knotAuditContext, string) {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, "workspace", "conversations", "feishu", "chat_aaaaaaaaaaaaaaaaaaaaaaaa")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir audit dir: %v", err)
+	}
+	return &knotAuditContext{
+		Root:               root,
+		ConversationDir:    dir,
+		Platform:           "feishu",
+		ChatIDHash:         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		PlatformUserIDHash: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		IdentityKeyHash:    "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		ActorUser:          "example-user",
+		GroupSlug:          "example-group",
+		CodexSessionID:     "codex-session",
+	}, filepath.Join(dir, "events.jsonl")
+}
+
+func readKnotAuditEvents(t *testing.T, path string) []map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var events []map[string]any
+	for _, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var row map[string]any
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			t.Fatalf("unmarshal audit row %q: %v", line, err)
+		}
+		events = append(events, row)
+	}
+	return events
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file %s: %v", path, err)
+	}
+	return data
+}
+
+func findKnotAuditEvent(events []map[string]any, name string) map[string]any {
+	for _, event := range events {
+		if event["event"] == name {
+			return event
+		}
+	}
+	return nil
+}
+
+func TestKnotAuditContextFromEnvValidatesConversationBinding(t *testing.T) {
+	root := t.TempDir()
+	chatHash := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	conversationDir := filepath.Join(root, "workspace", "conversations", "feishu", "chat_"+strings.TrimPrefix(chatHash, "sha256:")[:24])
+	if err := os.MkdirAll(conversationDir, 0o755); err != nil {
+		t.Fatalf("mkdir audit dir: %v", err)
+	}
+
+	valid := []string{
+		"KNOT_ROOT=" + root,
+		"KNOT_PLATFORM=feishu",
+		"KNOT_CHAT_ID_HASH=" + chatHash,
+		"KNOT_PLATFORM_USER_ID_HASH=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		"KNOT_IDENTITY_KEY_HASH=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		"KNOT_CONVERSATION_DIR=" + conversationDir,
+	}
+	if ctx := knotAuditContextFromEnv(valid); ctx == nil {
+		t.Fatal("expected valid Knot audit env to produce a context")
+	}
+
+	mismatch := append([]string(nil), valid...)
+	mismatch[5] = "KNOT_CONVERSATION_DIR=" + filepath.Join(root, "workspace", "conversations", "feishu", "chat_bbbbbbbbbbbbbbbbbbbbbbbb")
+	if ctx := knotAuditContextFromEnv(mismatch); ctx != nil {
+		t.Fatalf("expected mismatched conversation dir to be rejected: %#v", ctx)
+	}
+
+	rawHash := append([]string(nil), valid...)
+	rawHash[2] = "KNOT_CHAT_ID_HASH=oc_raw_chat"
+	if ctx := knotAuditContextFromEnv(rawHash); ctx != nil {
+		t.Fatalf("expected raw chat id hash to be rejected: %#v", ctx)
+	}
+
+	rawUserHash := append([]string(nil), valid...)
+	rawUserHash[3] = "KNOT_PLATFORM_USER_ID_HASH=ou_raw_user"
+	if ctx := knotAuditContextFromEnv(rawUserHash); ctx != nil {
+		t.Fatalf("expected raw platform user id hash to be rejected: %#v", ctx)
+	}
+
+	rawIdentityHash := append([]string(nil), valid...)
+	rawIdentityHash[4] = "KNOT_IDENTITY_KEY_HASH=feishu:user:ou_raw_user"
+	if ctx := knotAuditContextFromEnv(rawIdentityHash); ctx != nil {
+		t.Fatalf("expected raw identity key hash to be rejected: %#v", ctx)
+	}
 }
 
 type recallCheckingPlatform struct {
@@ -299,16 +404,24 @@ func (p *blockingRegisterPlatform) Stop() error {
 
 type stubMediaPlatform struct {
 	stubPlatformEngine
-	images []ImageAttachment
-	files  []FileAttachment
+	images   []ImageAttachment
+	files    []FileAttachment
+	imageErr error
+	fileErr  error
 }
 
 func (p *stubMediaPlatform) SendImage(_ context.Context, _ any, img ImageAttachment) error {
+	if p.imageErr != nil {
+		return p.imageErr
+	}
 	p.images = append(p.images, img)
 	return nil
 }
 
 func (p *stubMediaPlatform) SendFile(_ context.Context, _ any, file FileAttachment) error {
+	if p.fileErr != nil {
+		return p.fileErr
+	}
 	p.files = append(p.files, file)
 	return nil
 }
@@ -743,6 +856,209 @@ func TestEngineSendToSessionWithAttachments(t *testing.T) {
 	}
 	if len(p.files) != 1 || p.files[0].FileName != "report.txt" {
 		t.Fatalf("files = %#v", p.files)
+	}
+}
+
+func TestEngineSendToSessionWithAttachmentsEmitsKnotDeliveryAudit(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	auditCtx, auditLog := newTestKnotAuditContext(t)
+	e.interactiveStates["session-1"] = &interactiveState{
+		platform:  p,
+		replyCtx:  "ctx-1",
+		knotAudit: auditCtx,
+	}
+
+	err := e.SendToSessionWithAttachments(
+		"session-1",
+		"delivery ready",
+		[]ImageAttachment{{MimeType: "image/png", Data: []byte("img"), FileName: "raw-session-key.png"}},
+		[]FileAttachment{{MimeType: "text/plain", Data: []byte("doc"), FileName: "identity-key.txt"}},
+	)
+	if err != nil {
+		t.Fatalf("SendToSessionWithAttachments returned error: %v", err)
+	}
+
+	events := readKnotAuditEvents(t, auditLog)
+	sent := 0
+	for _, event := range events {
+		if event["event"] == "delivery.sent" {
+			sent++
+			if event["resource_sha256"] == "" || event["resource_size_bytes"].(float64) == 0 {
+				t.Fatalf("delivery.sent missing resource metadata: %#v", event)
+			}
+		}
+	}
+	if sent != 2 {
+		t.Fatalf("delivery.sent events = %d, want 2; events=%#v", sent, events)
+	}
+	raw := string(mustReadFile(t, auditLog))
+	for _, forbidden := range []string{"ctx-1", "session-1", "raw-session-key", "identity-key.txt"} {
+		if strings.Contains(raw, forbidden) {
+			t.Fatalf("audit log leaked %q:\n%s", forbidden, raw)
+		}
+	}
+}
+
+func TestEngineSendToSessionWithAttachmentsEmitsKnotDeliveryFailureAudit(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}, fileErr: errors.New("send failed")}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	auditCtx, auditLog := newTestKnotAuditContext(t)
+	e.interactiveStates["session-1"] = &interactiveState{
+		platform:  p,
+		replyCtx:  "ctx-1",
+		knotAudit: auditCtx,
+	}
+
+	err := e.SendToSessionWithAttachments(
+		"session-1",
+		"",
+		nil,
+		[]FileAttachment{{MimeType: "text/plain", Data: []byte("doc"), FileName: "report.txt"}},
+	)
+	if err == nil {
+		t.Fatal("expected attachment send failure")
+	}
+
+	events := readKnotAuditEvents(t, auditLog)
+	failed := findKnotAuditEvent(events, "delivery.failed")
+	if failed == nil || failed["reason_code"] != "send_failed" || failed["resource_kind"] != "file" {
+		t.Fatalf("delivery.failed event = %#v, events=%#v", failed, events)
+	}
+}
+
+func TestEngineSendToSessionWithAttachmentsAuditsOutgoingWaitFailure(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "test"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetOutgoingRateLimitCfg(OutgoingRateLimitCfg{MaxPerSecond: 1, Burst: 1}, nil)
+	auditCtx, auditLog := newTestKnotAuditContext(t)
+	e.interactiveStates["session-1"] = &interactiveState{
+		platform:  p,
+		replyCtx:  "ctx-1",
+		knotAudit: auditCtx,
+	}
+
+	if err := e.waitOutgoing(p); err != nil {
+		t.Fatalf("pre-consuming outgoing token failed: %v", err)
+	}
+	e.cancel()
+
+	err := e.SendToSessionWithAttachments(
+		"session-1",
+		"",
+		nil,
+		[]FileAttachment{{MimeType: "text/plain", Data: []byte("doc"), FileName: "report.txt"}},
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if len(p.files) != 0 {
+		t.Fatalf("files = %#v, want no send after outgoing wait failure", p.files)
+	}
+
+	events := readKnotAuditEvents(t, auditLog)
+	failed := findKnotAuditEvent(events, "delivery.failed")
+	if failed == nil || failed["reason_code"] != "send_failed" || failed["resource_kind"] != "file" {
+		t.Fatalf("delivery.failed event = %#v, events=%#v", failed, events)
+	}
+}
+
+func TestSendAttachmentDirectivesWithNoticeEmitsKnotAudit(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	auditCtx, auditLog := newTestKnotAuditContext(t)
+	reportPath := filepath.Join(auditCtx.Root, "workspace", "users", "example-user", "deliverables", "report.txt")
+	if err := os.MkdirAll(filepath.Dir(reportPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(reportPath, []byte("report"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e.sendAttachmentDirectivesWithNotice(p, "ctx-directive", []outboundAttachmentDirective{{kind: "file", path: reportPath}}, auditCtx.Root, auditCtx)
+
+	events := readKnotAuditEvents(t, auditLog)
+	sent := findKnotAuditEvent(events, "delivery.sent")
+	if sent == nil || sent["resource_kind"] != "file" || sent["resource_path"] != "workspace/users/example-user/deliverables/report.txt" {
+		t.Fatalf("delivery.sent event = %#v, events=%#v", sent, events)
+	}
+	if strings.Contains(string(mustReadFile(t, auditLog)), "ctx-directive") {
+		t.Fatalf("audit log leaked reply context:\n%s", mustReadFile(t, auditLog))
+	}
+}
+
+func TestSendAttachmentDirectivesWithNoticeEmitsKnotFailureAudit(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}, fileErr: errors.New("send failed")}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	auditCtx, auditLog := newTestKnotAuditContext(t)
+	reportPath := filepath.Join(auditCtx.Root, "report.txt")
+	if err := os.WriteFile(reportPath, []byte("report"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e.sendAttachmentDirectivesWithNotice(p, "ctx-directive-fail", []outboundAttachmentDirective{{kind: "file", path: reportPath}}, auditCtx.Root, auditCtx)
+
+	events := readKnotAuditEvents(t, auditLog)
+	failed := findKnotAuditEvent(events, "delivery.failed")
+	if failed == nil || failed["reason_code"] != "send_failed" || failed["resource_kind"] != "file" {
+		t.Fatalf("delivery.failed event = %#v, events=%#v", failed, events)
+	}
+	if strings.Contains(string(mustReadFile(t, auditLog)), "ctx-directive-fail") {
+		t.Fatalf("audit log leaked reply context:\n%s", mustReadFile(t, auditLog))
+	}
+}
+
+func TestProcessInteractiveMessageWithEmitsKnotInputRefAudit(t *testing.T) {
+	p := &stubPlatformEngine{n: "feishu"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	auditCtx, auditLog := newTestKnotAuditContext(t)
+	sessionKey := "feishu:raw-chat:raw-user"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	session.CompareAndSetAgentSessionID("s-input-audit", e.agent.Name())
+	if !session.TryLock() {
+		t.Fatal("session should lock")
+	}
+	agentSession := newControllableSession("s-input-audit")
+	agentSession.events <- Event{Type: EventResult, Content: "ok", Done: true}
+	state := &interactiveState{
+		agentSession:     agentSession,
+		platform:         p,
+		replyCtx:         "ctx-input-audit",
+		knotAudit:        auditCtx,
+		eventsNeedResync: false,
+	}
+	e.interactiveStates[sessionKey] = state
+
+	msg := &Message{
+		SessionKey: sessionKey,
+		Platform:   "feishu",
+		UserID:     "raw-user",
+		Content:    "please inspect this",
+		Images:     []ImageAttachment{{MimeType: "image/png", Data: []byte("image-data"), FileName: "quoted-image.png"}},
+		Files:      []FileAttachment{{MimeType: "text/plain", Data: []byte("file-data"), FileName: "quoted-file.txt"}},
+		ReplyCtx:   "ctx-input-audit",
+	}
+
+	e.processInteractiveMessageWith(p, msg, session, e.agent, e.sessions, sessionKey, "", sessionKey)
+
+	events := readKnotAuditEvents(t, auditLog)
+	inputRefs := 0
+	for _, event := range events {
+		if event["event"] == "input.ref.recorded" {
+			inputRefs++
+			if event["resource_sha256"] == "" || event["resource_size_bytes"].(float64) == 0 {
+				t.Fatalf("input.ref.recorded missing resource metadata: %#v", event)
+			}
+		}
+	}
+	if inputRefs != 2 {
+		t.Fatalf("input.ref.recorded events = %d, want 2; events=%#v", inputRefs, events)
+	}
+	raw := string(mustReadFile(t, auditLog))
+	for _, forbidden := range []string{"please inspect this", "quoted-image.png", "quoted-file.txt", "raw-chat", "raw-user", "ctx-input-audit"} {
+		if strings.Contains(raw, forbidden) {
+			t.Fatalf("audit log leaked %q:\n%s", forbidden, raw)
+		}
 	}
 }
 
@@ -1470,6 +1786,7 @@ func TestProcessInteractiveEvents_HiddenToolProgressKeepsPreviewOnFinalize(t *te
 func TestProcessInteractiveEvents_EmptyResultRetriesBeforeUserVisibleReply(t *testing.T) {
 	p := &stubPlatformEngine{n: "dingtalk"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	auditCtx, auditLog := newTestKnotAuditContext(t)
 	sessionKey := "dingtalk:user-empty-recovery"
 	session := e.sessions.GetOrCreateActive(sessionKey)
 	agentSession := newControllableSession("s-empty-recovery")
@@ -1477,6 +1794,7 @@ func TestProcessInteractiveEvents_EmptyResultRetriesBeforeUserVisibleReply(t *te
 		agentSession: agentSession,
 		platform:     p,
 		replyCtx:     "ctx-empty-recovery",
+		knotAudit:    auditCtx,
 	}
 	e.interactiveStates[sessionKey] = state
 
@@ -1502,11 +1820,23 @@ func TestProcessInteractiveEvents_EmptyResultRetriesBeforeUserVisibleReply(t *te
 		!strings.Contains(prompts[0], "Do not mention cc-connect") {
 		t.Fatalf("recovery prompt = %q, want internal non-user-visible recovery instruction", prompts[0])
 	}
+
+	events := readKnotAuditEvents(t, auditLog)
+	if findKnotAuditEvent(events, "recovery.prompt_sent") == nil || findKnotAuditEvent(events, "recovery.completed") == nil {
+		t.Fatalf("missing recovery audit events: %#v", events)
+	}
+	raw := string(mustReadFile(t, auditLog))
+	for _, forbidden := range []string{"Internal cc-connect recovery instruction", "ctx-empty-recovery", "user-empty-recovery"} {
+		if strings.Contains(raw, forbidden) {
+			t.Fatalf("audit log leaked %q:\n%s", forbidden, raw)
+		}
+	}
 }
 
 func TestProcessInteractiveEvents_EmptyResultRecoveryRetriesOnlyOnce(t *testing.T) {
 	p := &stubPlatformEngine{n: "dingtalk"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	auditCtx, auditLog := newTestKnotAuditContext(t)
 	sessionKey := "dingtalk:user-empty-recovery-once"
 	session := e.sessions.GetOrCreateActive(sessionKey)
 	agentSession := newControllableSession("s-empty-recovery-once")
@@ -1514,6 +1844,7 @@ func TestProcessInteractiveEvents_EmptyResultRecoveryRetriesOnlyOnce(t *testing.
 		agentSession: agentSession,
 		platform:     p,
 		replyCtx:     "ctx-empty-recovery-once",
+		knotAudit:    auditCtx,
 	}
 	e.interactiveStates[sessionKey] = state
 
@@ -1536,11 +1867,16 @@ func TestProcessInteractiveEvents_EmptyResultRecoveryRetriesOnlyOnce(t *testing.
 	if promptCount != 1 {
 		t.Fatalf("recovery prompt count = %d, want 1", promptCount)
 	}
+	events := readKnotAuditEvents(t, auditLog)
+	if findKnotAuditEvent(events, "recovery.prompt_sent") == nil || findKnotAuditEvent(events, "recovery.failed") == nil {
+		t.Fatalf("missing failed recovery audit events: %#v", events)
+	}
 }
 
 func TestProcessInteractiveEvents_EmptyResultRecoverySuppressesSideAttachmentFallback(t *testing.T) {
 	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	auditCtx, auditLog := newTestKnotAuditContext(t)
 	sessionKey := "dingtalk:user-empty-recovery-side-attachment"
 	session := e.sessions.GetOrCreateActive(sessionKey)
 	agentSession := newControllableSession("s-empty-recovery-side-attachment")
@@ -1548,6 +1884,7 @@ func TestProcessInteractiveEvents_EmptyResultRecoverySuppressesSideAttachmentFal
 		agentSession: agentSession,
 		platform:     p,
 		replyCtx:     "ctx-empty-recovery-side-attachment",
+		knotAudit:    auditCtx,
 	}
 	e.interactiveStates[sessionKey] = state
 
@@ -1586,6 +1923,10 @@ func TestProcessInteractiveEvents_EmptyResultRecoverySuppressesSideAttachmentFal
 	}
 	if len(p.images) != 1 || p.images[0].FileName != "generated.png" {
 		t.Fatalf("images = %#v, want generated.png", p.images)
+	}
+	events := readKnotAuditEvents(t, auditLog)
+	if findKnotAuditEvent(events, "delivery.sent") == nil || findKnotAuditEvent(events, "recovery.completed") == nil {
+		t.Fatalf("missing side attachment recovery audit events: %#v", events)
 	}
 }
 

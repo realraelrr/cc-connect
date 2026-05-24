@@ -329,6 +329,7 @@ type interactiveState struct {
 	replyCtx               any
 	currentMessageID       string
 	workspaceDir           string
+	knotAudit              *knotAuditContext
 	agent                  Agent
 	mu                     sync.Mutex
 	stopCh                 chan struct{}
@@ -2776,9 +2777,21 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	state := e.getOrCreateInteractiveStateWith(interactiveKey, p, msg.ReplyCtx, session, sessions, agentOverride, ccSessionKey)
 
 	// Set workspaceDir on the state for idle reaper identification
+	var auditCtx *knotAuditContext
+	if e.knotWorkspace {
+		auditCtx = knotAuditContextFromEnv(e.knotEnvForSession(interactiveKey))
+		if auditCtx != nil && state.agentSession != nil {
+			auditCtx = auditCtx.withCodexSessionID(state.agentSession.CurrentSessionID())
+		}
+	}
 	if workspaceDir != "" {
 		state.mu.Lock()
 		state.workspaceDir = workspaceDir
+		state.knotAudit = auditCtx
+		state.mu.Unlock()
+	} else if auditCtx != nil {
+		state.mu.Lock()
+		state.knotAudit = auditCtx
 		state.mu.Unlock()
 	}
 
@@ -2854,7 +2867,16 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 	state.fromVoice = msg.FromVoice
 	state.sideText = ""
 	state.sideDeliveryDone = false
+	if auditCtx == nil {
+		auditCtx = state.knotAudit
+	}
 	state.mu.Unlock()
+	for _, img := range msg.Images {
+		auditCtx.emit("input.ref.recorded", "recorded", "", knotAuditResource{Kind: "image", Data: img.Data})
+	}
+	for _, file := range msg.Files {
+		auditCtx.emit("input.ref.recorded", "recorded", "", knotAuditResource{Kind: "file", Data: file.Data})
+	}
 
 	// Run Send concurrently with processInteractiveEvents. Some agents block inside
 	// Send until the prompt turn finishes (e.g. ACP session/prompt); they may emit
@@ -3066,6 +3088,7 @@ func (e *Engine) resolveKnotWorkspace(msg *Message) (*knotWorkspaceResolution, e
 		"--platform", platform,
 		"--user-id", userID,
 		"--identity-key", identityKey,
+		"--emit-conversation-initialized",
 	}
 	if root != "" {
 		args = append(args, "--root", root)
@@ -3832,6 +3855,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	triggerAutoCompress := false
 	pendingSend := sendDone
 	emptyReplyRecoveryAttempted := false
+	recoveryAuditOpen := false
+	recoveryAuditClosed := false
 
 	// stopTyping tracks the current turn's typing indicator so it can be
 	// stopped when a queued message starts a new turn.
@@ -3850,6 +3875,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 	state.mu.Lock()
 	workspaceDir := state.workspaceDir
+	auditCtx := state.knotAudit
+	if auditCtx != nil && state.agentSession != nil {
+		auditCtx = auditCtx.withCodexSessionID(state.agentSession.CurrentSessionID())
+	}
 	replyAgent := state.agent
 	if replyAgent == nil {
 		replyAgent = e.agent
@@ -3930,7 +3959,14 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		state.mu.Lock()
 		state.sideText = ""
 		state.sideDeliveryDone = false
+		queuedAudit := state.knotAudit
 		state.mu.Unlock()
+		for _, img := range queued.images {
+			queuedAudit.emit("input.ref.recorded", "recorded", "", knotAuditResource{Kind: "image", Data: img.Data})
+		}
+		for _, file := range queued.files {
+			queuedAudit.emit("input.ref.recorded", "recorded", "", knotAuditResource{Kind: "file", Data: file.Data})
+		}
 
 		nextSend := make(chan error, 1)
 		go func() {
@@ -3952,6 +3988,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		partialText = ""
 		triggerAutoCompress = false
 		emptyReplyRecoveryAttempted = false
+		recoveryAuditOpen = false
+		recoveryAuditClosed = false
 		turnStart = time.Now()
 		firstEventLogged = false
 		waitStart = time.Now()
@@ -4627,6 +4665,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					nextSend <- state.agentSession.Send(emptyReplyRecoveryPrompt, nil, nil)
 				}()
 				pendingSend = nextSend
+				auditCtx.emit("recovery.prompt_sent", "sent", "recovery_empty", knotAuditResource{})
+				recoveryAuditOpen = true
 
 				textParts = nil
 				segmentStart = 0
@@ -4658,6 +4698,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				continue
 			}
 			if strings.TrimSpace(fullResponse) == "" && !sideDeliveryDone {
+				if recoveryAuditOpen && !recoveryAuditClosed {
+					auditCtx.emit("recovery.failed", "failed", "recovery_empty", knotAuditResource{})
+					recoveryAuditClosed = true
+				}
 				fullResponse = e.i18n.T(MsgEmptyResponse)
 			}
 
@@ -4676,6 +4720,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				cleanResponse = baseResponse
 			}
 			sideDeliveryOnly := sideDeliveryDone && strings.TrimSpace(baseResponse) == "" && len(attachmentDirectives) == 0
+			if recoveryAuditOpen && !recoveryAuditClosed && (strings.TrimSpace(baseResponse) != "" || len(attachmentDirectives) > 0 || sideDeliveryDone) {
+				auditCtx.emit("recovery.completed", "completed", "", knotAuditResource{})
+				recoveryAuditClosed = true
+			}
 
 			contextEstimate := estimateTokensWithPendingAssistant(session.GetHistory(0), baseResponse)
 
@@ -4870,7 +4918,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 			if len(attachmentDirectives) > 0 {
-				e.sendAttachmentDirectivesWithNotice(p, replyCtx, attachmentDirectives, workspaceDir)
+				e.sendAttachmentDirectivesWithNotice(p, replyCtx, attachmentDirectives, workspaceDir, auditCtx)
 			}
 
 			// TTS: async voice reply if enabled (skipped for silent replies)
@@ -9359,10 +9407,15 @@ func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images
 
 	var p Platform
 	var replyCtx any
+	var auditCtx *knotAuditContext
 	if state != nil {
 		state.mu.Lock()
 		p = state.platform
 		replyCtx = state.replyCtx
+		auditCtx = state.knotAudit
+		if auditCtx != nil && state.agentSession != nil {
+			auditCtx = auditCtx.withCodexSessionID(state.agentSession.CurrentSessionID())
+		}
 		state.mu.Unlock()
 	}
 
@@ -9413,6 +9466,7 @@ func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images
 		return fmt.Errorf("message or attachment is required")
 	}
 	if hasAttachments && !e.attachmentSendEnabled {
+		auditCtx.emitDeliveryFailed("send_failed", knotAuditResource{})
 		return ErrAttachmentSendDisabled
 	}
 
@@ -9421,6 +9475,9 @@ func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images
 		var ok bool
 		imageSender, ok = p.(ImageSender)
 		if !ok {
+			for _, img := range images {
+				auditCtx.emitDeliveryFailed("send_failed", knotAuditResource{Kind: "image", Data: img.Data})
+			}
 			return fmt.Errorf("platform %s: %w", p.Name(), ErrNotSupported)
 		}
 	}
@@ -9430,6 +9487,9 @@ func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images
 		var ok bool
 		fileSender, ok = p.(FileSender)
 		if !ok {
+			for _, file := range files {
+				auditCtx.emitDeliveryFailed("send_failed", knotAuditResource{Kind: "file", Data: file.Data})
+			}
 			return fmt.Errorf("platform %s: %w", p.Name(), ErrNotSupported)
 		}
 	}
@@ -9449,19 +9509,25 @@ func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images
 	}
 	for _, img := range images {
 		if err := e.waitOutgoing(p); err != nil {
+			auditCtx.emitDeliveryFailed("send_failed", knotAuditResource{Kind: "image", Data: img.Data})
 			return err
 		}
 		if err := imageSender.SendImage(e.ctx, replyCtx, img); err != nil {
+			auditCtx.emitDeliveryFailed("send_failed", knotAuditResource{Kind: "image", Data: img.Data})
 			return err
 		}
+		auditCtx.emitDeliverySent(knotAuditResource{Kind: "image", Data: img.Data})
 	}
 	for _, file := range files {
 		if err := e.waitOutgoing(p); err != nil {
+			auditCtx.emitDeliveryFailed("send_failed", knotAuditResource{Kind: "file", Data: file.Data})
 			return err
 		}
 		if err := fileSender.SendFile(e.ctx, replyCtx, file); err != nil {
+			auditCtx.emitDeliveryFailed("send_failed", knotAuditResource{Kind: "file", Data: file.Data})
 			return err
 		}
+		auditCtx.emitDeliverySent(knotAuditResource{Kind: "file", Data: file.Data})
 	}
 	if hasAttachments && state != nil {
 		state.mu.Lock()
@@ -9663,12 +9729,13 @@ func (e *Engine) sendForWorkspace(p Platform, replyCtx any, content, workspaceDi
 	_ = e.sendWithErrorForWorkspace(p, replyCtx, content, workspaceDir)
 }
 
-func (e *Engine) sendAttachmentDirectivesWithNotice(p Platform, replyCtx any, directives []outboundAttachmentDirective, workspaceDir string) {
+func (e *Engine) sendAttachmentDirectivesWithNotice(p Platform, replyCtx any, directives []outboundAttachmentDirective, workspaceDir string, auditCtx *knotAuditContext) {
 	var imageSender ImageSender
 	var fileSender FileSender
 	for _, dir := range directives {
 		attachment, err := buildAttachmentFromDirective(dir)
 		if err != nil {
+			auditCtx.emitDeliveryFailed("invalid_resource", knotAuditResource{Kind: dir.kind, Path: dir.path})
 			_ = e.sendWithErrorForWorkspace(p, replyCtx, "Attachment send failed: "+err.Error(), workspaceDir)
 			continue
 		}
@@ -9678,34 +9745,44 @@ func (e *Engine) sendAttachmentDirectivesWithNotice(p Platform, replyCtx any, di
 				var ok bool
 				imageSender, ok = p.(ImageSender)
 				if !ok {
+					auditCtx.emitDeliveryFailed("send_failed", knotAuditResource{Kind: attachment.kind, Path: dir.path})
 					_ = e.sendWithErrorForWorkspace(p, replyCtx, fmt.Sprintf("Attachment send failed: platform %s does not support images", p.Name()), workspaceDir)
 					continue
 				}
 			}
 			if err := e.waitOutgoing(p); err != nil {
 				slog.Warn("outgoing rate limit: context cancelled", "platform", p.Name(), "error", err)
+				auditCtx.emitDeliveryFailed("send_failed", knotAuditResource{Kind: attachment.kind, Path: dir.path})
 				return
 			}
 			if err := imageSender.SendImage(e.ctx, replyCtx, attachment.image); err != nil {
 				slog.Error("image attachment send failed", "platform", p.Name(), "error", err, "file", attachment.image.FileName)
+				auditCtx.emitDeliveryFailed("send_failed", knotAuditResource{Kind: attachment.kind, Path: dir.path})
 				_ = e.sendWithErrorForWorkspace(p, replyCtx, "Attachment send failed: "+err.Error(), workspaceDir)
+			} else {
+				auditCtx.emitDeliverySent(knotAuditResource{Kind: attachment.kind, Path: dir.path})
 			}
 		case "file":
 			if fileSender == nil {
 				var ok bool
 				fileSender, ok = p.(FileSender)
 				if !ok {
+					auditCtx.emitDeliveryFailed("send_failed", knotAuditResource{Kind: attachment.kind, Path: dir.path})
 					_ = e.sendWithErrorForWorkspace(p, replyCtx, fmt.Sprintf("Attachment send failed: platform %s does not support files", p.Name()), workspaceDir)
 					continue
 				}
 			}
 			if err := e.waitOutgoing(p); err != nil {
 				slog.Warn("outgoing rate limit: context cancelled", "platform", p.Name(), "error", err)
+				auditCtx.emitDeliveryFailed("send_failed", knotAuditResource{Kind: attachment.kind, Path: dir.path})
 				return
 			}
 			if err := fileSender.SendFile(e.ctx, replyCtx, attachment.file); err != nil {
 				slog.Error("file attachment send failed", "platform", p.Name(), "error", err, "file", attachment.file.FileName)
+				auditCtx.emitDeliveryFailed("send_failed", knotAuditResource{Kind: attachment.kind, Path: dir.path})
 				_ = e.sendWithErrorForWorkspace(p, replyCtx, "Attachment send failed: "+err.Error(), workspaceDir)
+			} else {
+				auditCtx.emitDeliverySent(knotAuditResource{Kind: attachment.kind, Path: dir.path})
 			}
 		}
 	}

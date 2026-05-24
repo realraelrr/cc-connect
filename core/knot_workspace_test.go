@@ -19,6 +19,7 @@ chat_id=""
 name=""
 group_name=""
 identity_key=""
+emit_conversation_initialized="false"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --root) shift; root="$1" ;;
@@ -28,11 +29,12 @@ while [ "$#" -gt 0 ]; do
     --name) shift; name="$1" ;;
     --group-name) shift; group_name="$1" ;;
     --identity-key) shift; identity_key="$1" ;;
+    --emit-conversation-initialized) emit_conversation_initialized="true" ;;
   esac
   shift
 done
 mkdir -p "$root/workspace/users/jane-example"
-printf "platform=%s\nuser_id=%s\nchat_id=%s\nname=%s\ngroup_name=%s\nidentity_key=%s\n" "$platform" "$user_id" "$chat_id" "$name" "$group_name" "$identity_key" > "$root/call.log"
+printf "platform=%s\nuser_id=%s\nchat_id=%s\nname=%s\ngroup_name=%s\nidentity_key=%s\nemit_conversation_initialized=%s\n" "$platform" "$user_id" "$chat_id" "$name" "$group_name" "$identity_key" "$emit_conversation_initialized" > "$root/call.log"
 printf "export KNOT_ACTIVE_WORKSPACE='%s'\n" "$root/workspace/users/jane-example"
 printf "export KNOT_USER_WORKSPACE='%s'\n" "$root/workspace/users/jane-example"
 printf "export KNOT_GROUP_WORKSPACE='%s'\n" "$root/workspace/groups/product-room"
@@ -88,6 +90,7 @@ func TestKnotWorkspaceResolverUsesHelperMetadata(t *testing.T) {
 		"name=Jane Example",
 		"group_name=Product Room",
 		"identity_key=feishu:user:ou_jane",
+		"emit_conversation_initialized=true",
 	} {
 		if !strings.Contains(string(got), wantLine) {
 			t.Fatalf("helper call log missing %q:\n%s", wantLine, got)
