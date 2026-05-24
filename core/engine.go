@@ -3065,7 +3065,7 @@ func (e *Engine) resolveKnotWorkspace(msg *Message) (*knotWorkspaceResolution, e
 		root = strings.TrimSpace(e.baseWorkDir)
 	}
 	if helper == "" && root != "" {
-		helper = filepath.Join(root, "bootstrap", "knot-workspace.sh")
+		helper = filepath.Join(root, "bin", "knot-workspace.sh")
 	}
 	if helper == "" {
 		return nil, fmt.Errorf("knot workspace helper is not configured")
