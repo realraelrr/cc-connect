@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -15,11 +16,14 @@ type knotAuditContext struct {
 	Root               string
 	ConversationDir    string
 	Platform           string
+	Scope              string
 	ChatIDHash         string
 	PlatformUserIDHash string
 	IdentityKeyHash    string
 	ActorUser          string
 	GroupSlug          string
+	UserWorkspace      string
+	GroupWorkspace     string
 	CodexSessionID     string
 }
 
@@ -64,17 +68,59 @@ func knotAuditContextFromEnv(env []string) *knotAuditContext {
 		Root:               strings.TrimSpace(values["KNOT_ROOT"]),
 		ConversationDir:    dir,
 		Platform:           strings.TrimSpace(values["KNOT_PLATFORM"]),
+		Scope:              strings.TrimSpace(values["KNOT_SCOPE"]),
 		ChatIDHash:         strings.TrimSpace(values["KNOT_CHAT_ID_HASH"]),
 		PlatformUserIDHash: strings.TrimSpace(values["KNOT_PLATFORM_USER_ID_HASH"]),
 		IdentityKeyHash:    strings.TrimSpace(values["KNOT_IDENTITY_KEY_HASH"]),
 		ActorUser:          strings.TrimSpace(values["KNOT_ACTOR_USER"]),
 		GroupSlug:          firstNonEmpty(strings.TrimSpace(values["KNOT_GROUP_SLUG"]), strings.TrimSpace(values["KNOT_SOURCE_GROUP"])),
+		UserWorkspace:      strings.TrimSpace(values["KNOT_USER_WORKSPACE"]),
+		GroupWorkspace:     strings.TrimSpace(values["KNOT_GROUP_WORKSPACE"]),
 		CodexSessionID:     strings.TrimSpace(values["KNOT_CODEX_SESSION_ID"]),
 	}
 	if !ctx.validEnvBinding() {
 		return nil
 	}
 	return ctx
+}
+
+func VerifyKnotOutboundAttachmentPathFromEnv(path string, env []string) (string, error) {
+	if !knotOutboundAttachmentPolicyRequired(env) {
+		return "", nil
+	}
+	ctx := knotAuditContextFromEnv(env)
+	if ctx == nil {
+		return "unauthorized_group", errors.New("invalid Knot attachment context")
+	}
+	if reason, err := ctx.verifyOutboundAttachmentPath(path); err != nil {
+		return reason, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "invalid_resource", err
+	}
+	if !info.IsDir() && fileHasMultipleLinks(info) {
+		return "hardlink_denied", errors.New("attachment hardlink denied")
+	}
+	return "", nil
+}
+
+func EmitKnotDeliveryFailedFromEnv(reasonCode, resourceKind, resourcePath string, env []string) bool {
+	ctx := knotAuditContextFromEnv(env)
+	if ctx == nil {
+		return false
+	}
+	ctx.emitDeliveryFailed(reasonCode, knotAuditResource{Kind: resourceKind, Path: resourcePath})
+	return true
+}
+
+func knotOutboundAttachmentPolicyRequired(env []string) bool {
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "KNOT_SCOPE=") && strings.TrimSpace(strings.TrimPrefix(entry, "KNOT_SCOPE=")) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func firstNonEmpty(values ...string) string {
@@ -164,6 +210,9 @@ func (ctx *knotAuditContext) validEnvBinding() bool {
 		return false
 	}
 	if ctx.IdentityKeyHash != "" && !validSHA256Hash(ctx.IdentityKeyHash) {
+		return false
+	}
+	if ctx.Scope != "" && ctx.Scope != "direct" && ctx.Scope != "group" {
 		return false
 	}
 	root, err := filepath.Abs(ctx.Root)

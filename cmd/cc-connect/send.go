@@ -160,11 +160,12 @@ func parseSendArgs(args []string) (core.SendRequest, string, error) {
 func loadImageAttachments(paths []string) ([]core.ImageAttachment, error) {
 	images := make([]core.ImageAttachment, 0, len(paths))
 	for _, path := range paths {
-		data, fileName, mimeType, err := readAttachment(path)
+		data, fileName, mimeType, err := readAttachment(path, "image")
 		if err != nil {
 			return nil, err
 		}
 		if !strings.HasPrefix(mimeType, "image/") {
+			core.EmitKnotDeliveryFailedFromEnv("invalid_resource", "image", filepath.Clean(path), os.Environ())
 			return nil, fmt.Errorf("%s is not an image (detected mime: %s)", path, mimeType)
 		}
 		images = append(images, core.ImageAttachment{MimeType: mimeType, Data: data, FileName: fileName})
@@ -175,7 +176,7 @@ func loadImageAttachments(paths []string) ([]core.ImageAttachment, error) {
 func loadFileAttachments(paths []string) ([]core.FileAttachment, error) {
 	files := make([]core.FileAttachment, 0, len(paths))
 	for _, path := range paths {
-		data, fileName, mimeType, err := readAttachment(path)
+		data, fileName, mimeType, err := readAttachment(path, "file")
 		if err != nil {
 			return nil, err
 		}
@@ -186,20 +187,36 @@ func loadFileAttachments(paths []string) ([]core.FileAttachment, error) {
 
 const maxAttachmentSize = 50 << 20 // 50 MB
 
-func readAttachment(path string) ([]byte, string, string, error) {
+func readAttachment(path, kind string) ([]byte, string, string, error) {
 	cleaned := filepath.Clean(path)
+	if reason, err := core.VerifyKnotOutboundAttachmentPathFromEnv(cleaned, os.Environ()); err != nil {
+		core.EmitKnotDeliveryFailedFromEnv(reason, kind, cleaned, os.Environ())
+		return nil, "", "", fmt.Errorf("Knot attachment boundary denied (%s): %w", reason, err)
+	}
 
 	info, err := os.Stat(cleaned)
 	if err != nil {
+		core.EmitKnotDeliveryFailedFromEnv("invalid_resource", kind, cleaned, os.Environ())
 		return nil, "", "", fmt.Errorf("read attachment %s: %w", path, err)
 	}
 	if info.Size() > maxAttachmentSize {
+		core.EmitKnotDeliveryFailedFromEnv("invalid_resource", kind, cleaned, os.Environ())
 		return nil, "", "", fmt.Errorf("attachment %s exceeds size limit (%d MB)", path, maxAttachmentSize>>20)
 	}
 
 	data, err := os.ReadFile(cleaned)
 	if err != nil {
+		core.EmitKnotDeliveryFailedFromEnv("attachment_read_failed", kind, cleaned, os.Environ())
 		return nil, "", "", fmt.Errorf("read attachment %s: %w", path, err)
+	}
+	afterInfo, err := os.Stat(cleaned)
+	if err != nil {
+		core.EmitKnotDeliveryFailedFromEnv("attachment_read_failed", kind, cleaned, os.Environ())
+		return nil, "", "", fmt.Errorf("stat attachment after read %s: %w", path, err)
+	}
+	if afterInfo.Size() != info.Size() || !afterInfo.ModTime().Equal(info.ModTime()) {
+		core.EmitKnotDeliveryFailedFromEnv("attachment_hash_mismatch", kind, cleaned, os.Environ())
+		return nil, "", "", fmt.Errorf("attachment changed during read: %s", path)
 	}
 	fileName := filepath.Base(cleaned)
 	return data, fileName, detectAttachmentMimeType(fileName, data), nil

@@ -187,37 +187,45 @@ func TestKnotAuditContextFromEnvValidatesConversationBinding(t *testing.T) {
 	valid := []string{
 		"KNOT_ROOT=" + root,
 		"KNOT_PLATFORM=feishu",
+		"KNOT_SCOPE=direct",
+		"KNOT_USER_WORKSPACE=" + filepath.Join(root, "workspace", "users", "example-user"),
 		"KNOT_CHAT_ID_HASH=" + chatHash,
 		"KNOT_PLATFORM_USER_ID_HASH=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 		"KNOT_IDENTITY_KEY_HASH=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 		"KNOT_CONVERSATION_DIR=" + conversationDir,
 	}
-	if ctx := knotAuditContextFromEnv(valid); ctx == nil {
+	if ctx := knotAuditContextFromEnv(valid); ctx == nil || ctx.Scope != "direct" || ctx.UserWorkspace == "" {
 		t.Fatal("expected valid Knot audit env to produce a context")
 	}
 
 	mismatch := append([]string(nil), valid...)
-	mismatch[5] = "KNOT_CONVERSATION_DIR=" + filepath.Join(root, "workspace", "conversations", "feishu", "chat_bbbbbbbbbbbbbbbbbbbbbbbb")
+	mismatch[7] = "KNOT_CONVERSATION_DIR=" + filepath.Join(root, "workspace", "conversations", "feishu", "chat_bbbbbbbbbbbbbbbbbbbbbbbb")
 	if ctx := knotAuditContextFromEnv(mismatch); ctx != nil {
 		t.Fatalf("expected mismatched conversation dir to be rejected: %#v", ctx)
 	}
 
 	rawHash := append([]string(nil), valid...)
-	rawHash[2] = "KNOT_CHAT_ID_HASH=oc_raw_chat"
+	rawHash[4] = "KNOT_CHAT_ID_HASH=oc_raw_chat"
 	if ctx := knotAuditContextFromEnv(rawHash); ctx != nil {
 		t.Fatalf("expected raw chat id hash to be rejected: %#v", ctx)
 	}
 
 	rawUserHash := append([]string(nil), valid...)
-	rawUserHash[3] = "KNOT_PLATFORM_USER_ID_HASH=ou_raw_user"
+	rawUserHash[5] = "KNOT_PLATFORM_USER_ID_HASH=ou_raw_user"
 	if ctx := knotAuditContextFromEnv(rawUserHash); ctx != nil {
 		t.Fatalf("expected raw platform user id hash to be rejected: %#v", ctx)
 	}
 
 	rawIdentityHash := append([]string(nil), valid...)
-	rawIdentityHash[4] = "KNOT_IDENTITY_KEY_HASH=feishu:user:ou_raw_user"
+	rawIdentityHash[6] = "KNOT_IDENTITY_KEY_HASH=feishu:user:ou_raw_user"
 	if ctx := knotAuditContextFromEnv(rawIdentityHash); ctx != nil {
 		t.Fatalf("expected raw identity key hash to be rejected: %#v", ctx)
+	}
+
+	invalidScope := append([]string(nil), valid...)
+	invalidScope[2] = "KNOT_SCOPE=personal"
+	if ctx := knotAuditContextFromEnv(invalidScope); ctx != nil {
+		t.Fatalf("expected invalid Knot scope to be rejected: %#v", ctx)
 	}
 }
 
@@ -975,7 +983,7 @@ func TestSendAttachmentDirectivesWithNoticeEmitsKnotAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e.sendAttachmentDirectivesWithNotice(p, "ctx-directive", []outboundAttachmentDirective{{kind: "file", path: reportPath}}, auditCtx.Root, auditCtx)
+	e.sendAttachmentDirectivesWithNotice(p, "ctx-directive", []outboundAttachmentDirective{{kind: "file", path: reportPath}}, auditCtx.Root, auditCtx, false)
 
 	events := readKnotAuditEvents(t, auditLog)
 	sent := findKnotAuditEvent(events, "delivery.sent")
@@ -984,6 +992,136 @@ func TestSendAttachmentDirectivesWithNoticeEmitsKnotAudit(t *testing.T) {
 	}
 	if strings.Contains(string(mustReadFile(t, auditLog)), "ctx-directive") {
 		t.Fatalf("audit log leaked reply context:\n%s", mustReadFile(t, auditLog))
+	}
+}
+
+func TestSendAttachmentDirectivesWithNoticeRejectsManualBlockOutsideKnotDeliverables(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	auditCtx, auditLog := newTestKnotAuditContext(t)
+	auditCtx.Scope = "direct"
+	auditCtx.UserWorkspace = filepath.Join(auditCtx.Root, "workspace", "users", "example-user")
+	if err := os.MkdirAll(filepath.Join(auditCtx.UserWorkspace, "deliverables"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secretPath := filepath.Join(auditCtx.Root, "runtime", ".env")
+	if err := os.MkdirAll(filepath.Dir(secretPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secretPath, []byte("token=secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	e.sendAttachmentDirectivesWithNotice(p, "ctx-directive", []outboundAttachmentDirective{{kind: "file", path: secretPath}}, auditCtx.Root, auditCtx, false)
+
+	if len(p.files) != 0 {
+		t.Fatalf("files sent = %#v, want none", p.files)
+	}
+	events := readKnotAuditEvents(t, auditLog)
+	failed := findKnotAuditEvent(events, "delivery.failed")
+	if failed == nil || failed["reason_code"] != "outside_deliverables" || failed["resource_kind"] != "file" {
+		t.Fatalf("delivery.failed event = %#v, events=%#v", failed, events)
+	}
+}
+
+func TestSendAttachmentDirectivesWithNoticeRejectsHardlinkedDeliverable(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	auditCtx, auditLog := newTestKnotAuditContext(t)
+	auditCtx.Scope = "direct"
+	auditCtx.UserWorkspace = filepath.Join(auditCtx.Root, "workspace", "users", "example-user")
+	deliverablesDir := filepath.Join(auditCtx.UserWorkspace, "deliverables")
+	if err := os.MkdirAll(deliverablesDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secretPath := filepath.Join(auditCtx.Root, "runtime", ".env")
+	if err := os.MkdirAll(filepath.Dir(secretPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secretPath, []byte("token=secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hardlinkPath := filepath.Join(deliverablesDir, "env.txt")
+	if err := os.Link(secretPath, hardlinkPath); err != nil {
+		t.Skipf("filesystem refused hardlink: %v", err)
+	}
+
+	e.sendAttachmentDirectivesWithNotice(p, "ctx-directive", []outboundAttachmentDirective{{kind: "file", path: hardlinkPath}}, auditCtx.Root, auditCtx, false)
+
+	if len(p.files) != 0 {
+		t.Fatalf("files sent = %#v, want none", p.files)
+	}
+	events := readKnotAuditEvents(t, auditLog)
+	failed := findKnotAuditEvent(events, "delivery.failed")
+	if failed == nil || failed["reason_code"] != "hardlink_denied" || failed["resource_kind"] != "file" {
+		t.Fatalf("delivery.failed event = %#v, events=%#v", failed, events)
+	}
+}
+
+func TestBuildAttachmentFromDirectiveWithPolicyDetectsChangedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "report.txt")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	originalRead := readAttachmentFile
+	t.Cleanup(func() { readAttachmentFile = originalRead })
+	readAttachmentFile = func(name string) ([]byte, error) {
+		if err := os.WriteFile(name, []byte("changed during read"), 0o644); err != nil {
+			return nil, err
+		}
+		return os.ReadFile(name)
+	}
+
+	_, reason, err := buildAttachmentFromDirectiveWithPolicy(outboundAttachmentDirective{kind: "file", path: path}, nil)
+
+	if err == nil || reason != "attachment_hash_mismatch" {
+		t.Fatalf("reason=%q err=%v, want attachment_hash_mismatch", reason, err)
+	}
+}
+
+func TestSendAttachmentDirectivesWithNoticeAllowsKnotDirectDeliverable(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	auditCtx, auditLog := newTestKnotAuditContext(t)
+	auditCtx.Scope = "direct"
+	auditCtx.UserWorkspace = filepath.Join(auditCtx.Root, "workspace", "users", "example-user")
+	reportPath := filepath.Join(auditCtx.UserWorkspace, "deliverables", "report.txt")
+	if err := os.MkdirAll(filepath.Dir(reportPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(reportPath, []byte("report"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e.sendAttachmentDirectivesWithNotice(p, "ctx-directive", []outboundAttachmentDirective{{kind: "file", path: reportPath}}, auditCtx.Root, auditCtx, false)
+
+	if len(p.files) != 1 || p.files[0].FileName != "report.txt" {
+		t.Fatalf("files sent = %#v, want report.txt", p.files)
+	}
+	events := readKnotAuditEvents(t, auditLog)
+	sent := findKnotAuditEvent(events, "delivery.sent")
+	if sent == nil || sent["resource_kind"] != "file" || sent["resource_path"] != "workspace/users/example-user/deliverables/report.txt" {
+		t.Fatalf("delivery.sent event = %#v, events=%#v", sent, events)
+	}
+}
+
+func TestSendAttachmentDirectivesWithNoticeFailsClosedWhenKnotPolicyContextInvalid(t *testing.T) {
+	p := &stubMediaPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	root := t.TempDir()
+	reportPath := filepath.Join(root, "workspace", "users", "example-user", "deliverables", "report.txt")
+	if err := os.MkdirAll(filepath.Dir(reportPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(reportPath, []byte("report"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	e.sendAttachmentDirectivesWithNotice(p, "ctx-directive", []outboundAttachmentDirective{{kind: "file", path: reportPath}}, root, nil, true)
+
+	if len(p.files) != 0 {
+		t.Fatalf("files sent = %#v, want none", p.files)
 	}
 }
 
@@ -996,7 +1134,7 @@ func TestSendAttachmentDirectivesWithNoticeEmitsKnotFailureAudit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	e.sendAttachmentDirectivesWithNotice(p, "ctx-directive-fail", []outboundAttachmentDirective{{kind: "file", path: reportPath}}, auditCtx.Root, auditCtx)
+	e.sendAttachmentDirectivesWithNotice(p, "ctx-directive-fail", []outboundAttachmentDirective{{kind: "file", path: reportPath}}, auditCtx.Root, auditCtx, false)
 
 	events := readKnotAuditEvents(t, auditLog)
 	failed := findKnotAuditEvent(events, "delivery.failed")

@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/chenhg5/cc-connect/core"
@@ -88,7 +89,7 @@ func TestReadAttachment_SizeLimit(t *testing.T) {
 	if err := os.WriteFile(small, []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := readAttachment(small); err != nil {
+	if _, _, _, err := readAttachment(small, "file"); err != nil {
 		t.Fatalf("small file should succeed: %v", err)
 	}
 
@@ -102,7 +103,7 @@ func TestReadAttachment_SizeLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.Close()
-	if _, _, _, err := readAttachment(big); err == nil {
+	if _, _, _, err := readAttachment(big, "file"); err == nil {
 		t.Fatal("oversized file should be rejected")
 	}
 }
@@ -120,7 +121,7 @@ func TestReadAttachment_CleanPath(t *testing.T) {
 
 	// Path with ../ should still work after cleaning
 	dirty := filepath.Join(sub, "..", "sub", "test.txt")
-	data, name, _, err := readAttachment(dirty)
+	data, name, _, err := readAttachment(dirty, "file")
 	if err != nil {
 		t.Fatalf("readAttachment with dirty path: %v", err)
 	}
@@ -129,6 +130,56 @@ func TestReadAttachment_CleanPath(t *testing.T) {
 	}
 	if name != "test.txt" {
 		t.Errorf("unexpected filename: %q", name)
+	}
+}
+
+func TestReadAttachment_EnforcesKnotDeliverablesBoundary(t *testing.T) {
+	root := t.TempDir()
+	userWorkspace := filepath.Join(root, "workspace", "users", "example-user")
+	deliverable := filepath.Join(userWorkspace, "deliverables", "report.txt")
+	secret := filepath.Join(root, "runtime", ".env")
+	conversationDir := filepath.Join(root, "workspace", "conversations", "feishu", "chat_aaaaaaaaaaaaaaaaaaaaaaaa")
+	for _, dir := range []string{filepath.Dir(deliverable), filepath.Dir(secret), conversationDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(deliverable, []byte("report"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(secret, []byte("token=secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("KNOT_ROOT", root)
+	t.Setenv("KNOT_SCOPE", "direct")
+	t.Setenv("KNOT_PLATFORM", "feishu")
+	t.Setenv("KNOT_CHAT_ID_HASH", "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	t.Setenv("KNOT_PLATFORM_USER_ID_HASH", "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	t.Setenv("KNOT_IDENTITY_KEY_HASH", "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+	t.Setenv("KNOT_CONVERSATION_DIR", conversationDir)
+	t.Setenv("KNOT_ACTOR_USER", "example-user")
+	t.Setenv("KNOT_USER_WORKSPACE", userWorkspace)
+
+	if _, _, _, err := readAttachment(deliverable, "file"); err != nil {
+		t.Fatalf("Knot deliverable should be readable: %v", err)
+	}
+	if _, _, _, err := readAttachment(secret, "file"); err == nil {
+		t.Fatal("Knot runtime secret path should be rejected")
+	}
+	eventLog := filepath.Join(conversationDir, "events.jsonl")
+	if data, err := os.ReadFile(eventLog); err != nil || !strings.Contains(string(data), `"reason_code":"outside_deliverables"`) {
+		t.Fatalf("expected outside_deliverables audit event, data=%q err=%v", data, err)
+	}
+	hardlinkPath := filepath.Join(userWorkspace, "deliverables", "env.txt")
+	if err := os.Link(secret, hardlinkPath); err != nil {
+		t.Skipf("filesystem refused hardlink: %v", err)
+	}
+	if _, _, _, err := readAttachment(hardlinkPath, "file"); err == nil {
+		t.Fatal("Knot hardlinked deliverable should be rejected")
+	}
+	if data, err := os.ReadFile(eventLog); err != nil || !strings.Contains(string(data), `"reason_code":"hardlink_denied"`) {
+		t.Fatalf("expected hardlink_denied audit event, data=%q err=%v", data, err)
 	}
 }
 

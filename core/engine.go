@@ -330,6 +330,7 @@ type interactiveState struct {
 	currentMessageID       string
 	workspaceDir           string
 	knotAudit              *knotAuditContext
+	knotAttachmentPolicy   bool
 	agent                  Agent
 	mu                     sync.Mutex
 	stopCh                 chan struct{}
@@ -2778,8 +2779,11 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 
 	// Set workspaceDir on the state for idle reaper identification
 	var auditCtx *knotAuditContext
+	attachmentPolicyRequired := false
 	if e.knotWorkspace {
-		auditCtx = knotAuditContextFromEnv(e.knotEnvForSession(interactiveKey))
+		knotEnv := e.knotEnvForSession(interactiveKey)
+		attachmentPolicyRequired = knotOutboundAttachmentPolicyRequired(knotEnv)
+		auditCtx = knotAuditContextFromEnv(knotEnv)
 		if auditCtx != nil && state.agentSession != nil {
 			auditCtx = auditCtx.withCodexSessionID(state.agentSession.CurrentSessionID())
 		}
@@ -2788,10 +2792,12 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		state.mu.Lock()
 		state.workspaceDir = workspaceDir
 		state.knotAudit = auditCtx
+		state.knotAttachmentPolicy = attachmentPolicyRequired
 		state.mu.Unlock()
 	} else if auditCtx != nil {
 		state.mu.Lock()
 		state.knotAudit = auditCtx
+		state.knotAttachmentPolicy = attachmentPolicyRequired
 		state.mu.Unlock()
 	}
 
@@ -3876,6 +3882,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 	state.mu.Lock()
 	workspaceDir := state.workspaceDir
 	auditCtx := state.knotAudit
+	attachmentPolicyRequired := state.knotAttachmentPolicy
 	if auditCtx != nil && state.agentSession != nil {
 		auditCtx = auditCtx.withCodexSessionID(state.agentSession.CurrentSessionID())
 	}
@@ -4918,7 +4925,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 			if len(attachmentDirectives) > 0 {
-				e.sendAttachmentDirectivesWithNotice(p, replyCtx, attachmentDirectives, workspaceDir, auditCtx)
+				e.sendAttachmentDirectivesWithNotice(p, replyCtx, attachmentDirectives, workspaceDir, auditCtx, attachmentPolicyRequired)
 			}
 
 			// TTS: async voice reply if enabled (skipped for silent replies)
@@ -9729,13 +9736,20 @@ func (e *Engine) sendForWorkspace(p Platform, replyCtx any, content, workspaceDi
 	_ = e.sendWithErrorForWorkspace(p, replyCtx, content, workspaceDir)
 }
 
-func (e *Engine) sendAttachmentDirectivesWithNotice(p Platform, replyCtx any, directives []outboundAttachmentDirective, workspaceDir string, auditCtx *knotAuditContext) {
+func (e *Engine) sendAttachmentDirectivesWithNotice(p Platform, replyCtx any, directives []outboundAttachmentDirective, workspaceDir string, auditCtx *knotAuditContext, attachmentPolicyRequired bool) {
 	var imageSender ImageSender
 	var fileSender FileSender
 	for _, dir := range directives {
-		attachment, err := buildAttachmentFromDirective(dir)
+		if attachmentPolicyRequired && auditCtx == nil {
+			_ = e.sendWithErrorForWorkspace(p, replyCtx, "Attachment send failed: invalid Knot attachment context", workspaceDir)
+			continue
+		}
+		attachment, reasonCode, err := buildAttachmentFromDirectiveWithPolicy(dir, auditCtx)
 		if err != nil {
-			auditCtx.emitDeliveryFailed("invalid_resource", knotAuditResource{Kind: dir.kind, Path: dir.path})
+			if reasonCode == "" {
+				reasonCode = "invalid_resource"
+			}
+			auditCtx.emitDeliveryFailed(reasonCode, knotAuditResource{Kind: dir.kind, Path: dir.path})
 			_ = e.sendWithErrorForWorkspace(p, replyCtx, "Attachment send failed: "+err.Error(), workspaceDir)
 			continue
 		}
