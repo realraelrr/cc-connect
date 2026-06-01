@@ -254,3 +254,41 @@ func TestParseKnotWorkspaceExportsUnquotesPaths(t *testing.T) {
 		t.Fatalf("QUOTED = %q", exports["QUOTED"])
 	}
 }
+
+func TestHandleMessage_KnotWorkspaceResolutionErrorIsUserFriendly(t *testing.T) {
+	root := t.TempDir()
+	helper := filepath.Join(root, "knot-workspace.sh")
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+echo "actor identity is not uniquely mapped in workspace/admin/permissions.md" >&2
+exit 1
+`
+	if err := os.WriteFile(helper, []byte(script), 0o755); err != nil {
+		t.Fatalf("write helper: %v", err)
+	}
+
+	p := &stubPlatformEngine{n: "feishu"}
+	e := NewEngine("knot", &stubAgent{}, []Platform{p}, filepath.Join(root, "sessions.json"), LangChinese)
+	e.SetKnotWorkspace(helper, root)
+	e.handleMessage(p, &Message{
+		SessionKey: "feishu:oc_group:ou_unknown",
+		Platform:   "feishu",
+		UserID:     "ou_unknown",
+		UserName:   "Unknown User",
+		ChatName:   "Product Room",
+		ChannelKey: "oc_group",
+		Content:    "hello",
+		ReplyCtx:   "ctx",
+	})
+
+	sent := p.getSent()
+	if len(sent) != 1 {
+		t.Fatalf("sent = %#v, want one friendly error", sent)
+	}
+	if sent[0] != UnauthorizedAccessMessage {
+		t.Fatalf("sent[0] = %q, want %q", sent[0], UnauthorizedAccessMessage)
+	}
+	if strings.Contains(sent[0], "permissions.md") || strings.Contains(sent[0], "workspace/admin") {
+		t.Fatalf("friendly error leaked internals: %q", sent[0])
+	}
+}

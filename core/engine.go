@@ -2084,7 +2084,7 @@ func (e *Engine) handleMessage(p Platform, msg *Message) {
 		wsAgent, wsSessions, _, resolvedWorkspace, err = e.knotWorkspaceContext(msg, true)
 		if err != nil {
 			slog.Error("knot workspace resolution failed", "err", err)
-			e.reply(p, msg.ReplyCtx, fmt.Sprintf("Failed to resolve workspace: %v", err))
+			e.reply(p, msg.ReplyCtx, knotWorkspaceResolutionUserMessage(err))
 			return
 		}
 	} else if e.multiWorkspace {
@@ -2237,6 +2237,22 @@ sessionLocked:
 	)
 
 	go e.processInteractiveMessageWith(p, msg, session, agent, sessions, interactiveKey, resolvedWorkspace, msg.SessionKey)
+}
+
+func knotWorkspaceResolutionUserMessage(err error) string {
+	if err == nil {
+		return UnauthorizedAccessMessage
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "not uniquely mapped"),
+		strings.Contains(msg, "not authorized"),
+		strings.Contains(msg, "unauthorized"),
+		strings.Contains(msg, "permission"):
+		return UnauthorizedAccessMessage
+	default:
+		return "权限配置异常，请联系管理员检查。"
+	}
 }
 
 func (e *Engine) maybeAutoResetSessionOnIdle(p Platform, msg *Message, sessions *SessionManager, interactiveKey string, session *Session) *Session {
@@ -4162,7 +4178,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.markStopped()
 			gracePeriod := 10 * time.Second
 			graceTimer := time.NewTimer(gracePeriod)
-			graceLoop:
+		graceLoop:
 			for {
 				select {
 				case evt, ok := <-state.agentSession.Events():
