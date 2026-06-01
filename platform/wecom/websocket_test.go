@@ -296,7 +296,9 @@ func TestHandleMsgCallback_RepliesToUnauthorizedSender(t *testing.T) {
 			serverDone <- err
 			return
 		}
-		defer conn.Close()
+		defer func() {
+			_ = conn.Close()
+		}()
 		var frame wsFrame
 		if err := conn.ReadJSON(&frame); err != nil {
 			serverDone <- err
@@ -328,7 +330,9 @@ func TestHandleMsgCallback_RepliesToUnauthorizedSender(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial test websocket: %v", err)
 	}
-	defer conn.Close()
+	defer func() {
+		_ = conn.Close()
+	}()
 
 	p := &WSPlatform{
 		allowFrom: "allowed-user",
